@@ -5,26 +5,12 @@
 #include <SPI.h>
 #include <Wire.h>
 #include <Adafruit_SSD1306.h>
-#include <nRF24L01.h>
-#include <RF24.h>
 
 // Ethernet settings
 byte mac[] = { 0xA8, 0x61, 0x0A, 0xAE, 0x03, 0x30 };
 unsigned int localPort = 44158;
 EthernetUDP Udp;
 char packetBuffer[255];
-bool udpControllerKnown = false;
-
-// NRF24 radio settings
-// Mega listens on PTZ01. Handheld Nano controller should write to PTZ01.
-// Mega writes telemetry back to CTRL1. Nano should listen on CTRL1.
-const int NRF_CE_PIN = 46;
-const int NRF_CSN_PIN = 47;
-RF24 radio(NRF_CE_PIN, NRF_CSN_PIN);
-const byte radioMegaAddress[6] = "PTZ01";
-const byte radioControllerAddress[6] = "CTRL1";
-char radioBuffer[255];
-bool radioReady = false;
 
 // Define OLED settings
 #define SCREEN_WIDTH 128
@@ -84,28 +70,18 @@ bool posReceived = false;
 bool presetAReceived = false;
 bool presetBReceived = false;
 
-
-bool readControllerMessage(String &message);
-void processStartupResponse(String response);
-void processRequest(String request);
-void handleRadioRequests();
-void sendControllerMessage(const char *message);
-void sendRadioMessage(const char *message);
-void initializeRadio();
-
 void setup() {
     // Initialize hardware pins
     pinMode(ms1Pin1, OUTPUT); pinMode(ms2Pin1, OUTPUT);
     pinMode(ms1Pin2, OUTPUT); pinMode(ms2Pin2, OUTPUT);
     pinMode(ms1Pin3, OUTPUT); pinMode(ms2Pin3, OUTPUT);
     pinMode(ms1Pin4, OUTPUT); pinMode(ms2Pin4, OUTPUT);
-    // Motor 4 / zoom is not used in this radio build. Do not drive pin 50 because it is SPI MISO on the Mega.
-    // pinMode(tmcEnPin4, OUTPUT);
+    pinMode(tmcEnPin4, OUTPUT);
     digitalWrite(ms1Pin1, HIGH); digitalWrite(ms2Pin1, HIGH);
     digitalWrite(ms2Pin2, HIGH); digitalWrite(ms2Pin2, HIGH);
     digitalWrite(ms1Pin3, HIGH); digitalWrite(ms2Pin3, HIGH);
     digitalWrite(ms1Pin4, HIGH); digitalWrite(ms2Pin4, HIGH);
-    // digitalWrite(tmcEnPin4, LOW);
+    digitalWrite(tmcEnPin4, LOW);
 
     // Initialize stepper settings
     stepper1.setMaxSpeed(max_speed_left);  // Use max_speed_left instead of msSpeed
@@ -121,9 +97,6 @@ void setup() {
     Ethernet.begin(mac);
     Udp.begin(localPort);
 
-    // Initialize NRF24 radio
-    initializeRadio();
-
     // Initialize OLED display
     Wire.begin();
     display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -131,8 +104,7 @@ void setup() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
 
-    // Wait for the first message from either controller.
-    // This preserves Ethernet behavior but also allows the Nano NRF24 controller to wake the Mega.
+    // Wait for the first message from the controller to get its IP and port
     bool controllerFound = false;
     while (!controllerFound) {
         display.clearDisplay();
@@ -140,12 +112,12 @@ void setup() {
         display.println("Waiting Ctrl...");
         display.setCursor(0, 10);
         display.println(Ethernet.localIP());
-        display.setCursor(0, 20);
-        display.println(radioReady ? "Radio Ready" : "Radio Failed");
         display.display();
 
-        String incoming;
-        if (readControllerMessage(incoming)) {
+        int packetSize = Udp.parsePacket();
+        if (packetSize) {
+            int len = Udp.read(packetBuffer, 255);
+            if (len > 0) packetBuffer[len] = 0;
             controllerFound = true;
         }
         delay(10);
@@ -155,7 +127,7 @@ void setup() {
     int retryCount = 0;
     const int maxRetries = 3;
     while (retryCount < maxRetries && (!posReceived || !presetAReceived || !presetBReceived)) {
-        sendControllerMessage("GET_CURRENT_POS");
+        sendUDPMessage("GET_CURRENT_POS");
         display.clearDisplay();
         display.setCursor(0, 0);
         display.println("Requesting Data...");
@@ -169,11 +141,47 @@ void setup() {
         unsigned long startTime = millis();
 
         while (millis() - startTime < CONTROLLER_TIMEOUT) {
-            String response;
-            if (readControllerMessage(response)) {
-                processStartupResponse(response);
+            int packetSize = Udp.parsePacket();
+            if (packetSize) {
+                int len = Udp.read(packetBuffer, 255);
+                if (len > 0) packetBuffer[len] = 0;
+                String response = String(packetBuffer);
+                if (response.startsWith("SET_POS")) {
+                    int comma1 = response.indexOf(',');
+                    int comma2 = response.indexOf(',', comma1 + 1);
+                    int comma3 = response.indexOf(',', comma2 + 1);
+                    saved_position1 = atol(response.substring(7, comma1).c_str());
+                    saved_position2 = atol(response.substring(comma1 + 1, comma2).c_str());
+                    saved_position3 = atol(response.substring(comma2 + 1, comma3).c_str());
+                    saved_position4 = atol(response.substring(comma3 + 1).c_str());
+                    stepper1.setCurrentPosition(saved_position1);
+                    stepper2.setCurrentPosition(saved_position2);
+                    stepper3.setCurrentPosition(saved_position3);
+                    stepper4.setCurrentPosition(saved_position4);
+                    posReceived = true;
+                } else if (response.startsWith("SET_PRESET_A")) {
+                    int comma1 = response.indexOf(',');
+                    int comma2 = response.indexOf(',', comma1 + 1);
+                    int comma3 = response.indexOf(',', comma2 + 1);
+                    presetAPositions[0] = atol(response.substring(12, comma1).c_str());
+                    presetAPositions[1] = atol(response.substring(comma1 + 1, comma2).c_str());
+                    presetAPositions[2] = atol(response.substring(comma2 + 1, comma3).c_str());
+                    presetAPositions[3] = atol(response.substring(comma3 + 1).c_str());
+                    presetAReceived = true;
+                } else if (response.startsWith("SET_PRESET_B")) {
+                    int comma1 = response.indexOf(',');
+                    int comma2 = response.indexOf(',', comma1 + 1);
+                    int comma3 = response.indexOf(',', comma2 + 1);
+                    presetBPositions[0] = atol(response.substring(12, comma1).c_str());
+                    presetBPositions[1] = atol(response.substring(comma1 + 1, comma2).c_str());
+                    presetBPositions[2] = atol(response.substring(comma2 + 1, comma3).c_str());
+                    presetBPositions[3] = atol(response.substring(comma3 + 1).c_str());
+                    presetBReceived = true;
+                } else if (response.startsWith("SET_MSSPEED")) {
+                    msSpeed = response.substring(11).toFloat();
+                    max_speed_left = msSpeed;  // Update max_speed_left when msSpeed changes
+                }
             }
-
             delay(10);
             if (posReceived && presetAReceived && presetBReceived) break;
         }
@@ -206,7 +214,6 @@ void setup() {
 
 void loop() {
     handleUDPRequests();
-    handleRadioRequests();
     unsigned long currentMillis = millis();
     if (currentMillis - previousMillis >= updateInterval) {
         controlStepperMotors();
@@ -221,73 +228,54 @@ void loop() {
 void handleUDPRequests() {
     int packetSize = Udp.parsePacket();
     if (packetSize) {
-        int len = Udp.read(packetBuffer, 254);
+        int len = Udp.read(packetBuffer, 255);
         if (len > 0) packetBuffer[len] = 0;
-        packetBuffer[254] = 0;
-        udpControllerKnown = true;
-
         String request = String(packetBuffer);
-        processRequest(request);
-    }
-}
 
-void handleRadioRequests() {
-    if (!radioReady) return;
+        if (request.startsWith("SET_JOYSTICK")) {
+            int firstComma = request.indexOf(',');
+            int secondComma = request.indexOf(',', firstComma + 1);
+            int thirdComma = request.indexOf(',', secondComma + 1);
+            int fourthComma = request.indexOf(',', thirdComma + 1);
 
-    if (radio.available()) {
-        memset(radioBuffer, 0, sizeof(radioBuffer));
-        radio.read(&radioBuffer, sizeof(radioBuffer));
-        radioBuffer[254] = 0;
+            String x_axis_left_str = request.substring(13, firstComma);
+            String x_axis_right_str = request.substring(firstComma + 1, secondComma);
+            String y_axis_str = request.substring(secondComma + 1, thirdComma);
+            String trigger_left_str = request.substring(thirdComma + 1, fourthComma);
+            String trigger_right_str = request.substring(fourthComma + 1);
 
-        String request = String(radioBuffer);
-        processRequest(request);
-    }
-}
-
-void processRequest(String request) {
-    if (request.startsWith("SET_JOYSTICK")) {
-        int firstComma = request.indexOf(',');
-        int secondComma = request.indexOf(',', firstComma + 1);
-        int thirdComma = request.indexOf(',', secondComma + 1);
-        int fourthComma = request.indexOf(',', thirdComma + 1);
-
-        String x_axis_left_str = request.substring(13, firstComma);
-        String x_axis_right_str = request.substring(firstComma + 1, secondComma);
-        String y_axis_str = request.substring(secondComma + 1, thirdComma);
-        String trigger_left_str = request.substring(thirdComma + 1, fourthComma);
-        String trigger_right_str = request.substring(fourthComma + 1);
-
-        x_axis_value_left = x_axis_left_str.toFloat();
-        x_axis_value_right = x_axis_right_str.toFloat();
-        y_axis_value = y_axis_str.toFloat();
-        trigger_left = trigger_left_str.toFloat();
-        trigger_right = trigger_right_str.toFloat();
-    } else if (request.startsWith("SEND_CURRENT_POS")) {
-        if (setupComplete) {
-            sendCurrentMotorPositions();
+            x_axis_value_left = x_axis_left_str.toFloat();
+            x_axis_value_right = x_axis_right_str.toFloat();
+            y_axis_value = y_axis_str.toFloat();
+            trigger_left = trigger_left_str.toFloat();
+            trigger_right = trigger_right_str.toFloat();
+        } else if (request.startsWith("SEND_CURRENT_POS")) {
+            if (setupComplete) {
+                sendCurrentMotorPositions();
+            }
+        } else if (request.startsWith("SAVE_POS")) {
+            saveMotorPositions();
+        } else if (request.startsWith("RECALL_POS")) {
+            recallMotorPositions();
+        } else if (request.startsWith("SAVE_A")) {
+            savePresetA();
+        } else if (request.startsWith("SAVE_B")) {
+            savePresetB();
+        } else if (request.startsWith("RECALL_A")) {
+            recallPresetA();
+        } else if (request.startsWith("RECALL_B")) {
+            recallPresetB();
+        } else if (request.startsWith("UPDATE_LOOP")) {
+            loopPresets = request.substring(12) == "true";
+        } else if (request.startsWith("INCREASE_SPEED")) {
+            msSpeed += 200;
+            max_speed_left = msSpeed;  // Update max_speed_left
+            sendMsSpeed();
+        } else if (request.startsWith("DECREASE_SPEED")) {
+            msSpeed -= 200;
+            max_speed_left = msSpeed;  // Update max_speed_left
+            sendMsSpeed();
         }
-    } else if (request.startsWith("SAVE_POS")) {
-        saveMotorPositions();
-    } else if (request.startsWith("RECALL_POS")) {
-        recallMotorPositions();
-    } else if (request.startsWith("SAVE_A")) {
-        savePresetA();
-    } else if (request.startsWith("SAVE_B")) {
-        savePresetB();
-    } else if (request.startsWith("RECALL_A")) {
-        recallPresetA();
-    } else if (request.startsWith("RECALL_B")) {
-        recallPresetB();
-    } else if (request.startsWith("UPDATE_LOOP")) {
-        loopPresets = request.substring(12) == "true";
-    } else if (request.startsWith("INCREASE_SPEED")) {
-        msSpeed += 200;
-        max_speed_left = msSpeed;
-        sendMsSpeed();
-    } else if (request.startsWith("DECREASE_SPEED")) {
-        msSpeed -= 200;
-        max_speed_left = msSpeed;
-        sendMsSpeed();
     }
 }
 
@@ -343,126 +331,24 @@ int applyDeadzoneAndRemap(float input, int minInput, int maxInput, int minOutput
     return map(adjustedInput, -adjustedMaxInput, adjustedMaxInput, minOutput, maxOutput);
 }
 
-
-void initializeRadio() {
-    radioReady = radio.begin();
-
-    if (radioReady) {
-        radio.setPALevel(RF24_PA_HIGH);
-        radio.setDataRate(RF24_250KBPS);
-        radio.setChannel(108);
-
-        radio.openWritingPipe(radioControllerAddress);
-        radio.openReadingPipe(1, radioMegaAddress);
-        radio.startListening();
-    }
-}
-
-bool readControllerMessage(String &message) {
-    int packetSize = Udp.parsePacket();
-    if (packetSize) {
-        int len = Udp.read(packetBuffer, 254);
-        if (len > 0) packetBuffer[len] = 0;
-        packetBuffer[254] = 0;
-        udpControllerKnown = true;
-        message = String(packetBuffer);
-        return true;
-    }
-
-    if (radioReady && radio.available()) {
-        memset(radioBuffer, 0, sizeof(radioBuffer));
-        radio.read(&radioBuffer, sizeof(radioBuffer));
-        radioBuffer[254] = 0;
-        message = String(radioBuffer);
-        return true;
-    }
-
-    return false;
-}
-
-void processStartupResponse(String response) {
-    if (response.startsWith("SET_POS")) {
-        int comma1 = response.indexOf(',');
-        int comma2 = response.indexOf(',', comma1 + 1);
-        int comma3 = response.indexOf(',', comma2 + 1);
-
-        saved_position1 = atol(response.substring(7, comma1).c_str());
-        saved_position2 = atol(response.substring(comma1 + 1, comma2).c_str());
-        saved_position3 = atol(response.substring(comma2 + 1, comma3).c_str());
-        saved_position4 = atol(response.substring(comma3 + 1).c_str());
-
-        stepper1.setCurrentPosition(saved_position1);
-        stepper2.setCurrentPosition(saved_position2);
-        stepper3.setCurrentPosition(saved_position3);
-        stepper4.setCurrentPosition(saved_position4);
-
-        posReceived = true;
-    } else if (response.startsWith("SET_PRESET_A")) {
-        int comma1 = response.indexOf(',');
-        int comma2 = response.indexOf(',', comma1 + 1);
-        int comma3 = response.indexOf(',', comma2 + 1);
-
-        presetAPositions[0] = atol(response.substring(12, comma1).c_str());
-        presetAPositions[1] = atol(response.substring(comma1 + 1, comma2).c_str());
-        presetAPositions[2] = atol(response.substring(comma2 + 1, comma3).c_str());
-        presetAPositions[3] = atol(response.substring(comma3 + 1).c_str());
-
-        presetAReceived = true;
-    } else if (response.startsWith("SET_PRESET_B")) {
-        int comma1 = response.indexOf(',');
-        int comma2 = response.indexOf(',', comma1 + 1);
-        int comma3 = response.indexOf(',', comma2 + 1);
-
-        presetBPositions[0] = atol(response.substring(12, comma1).c_str());
-        presetBPositions[1] = atol(response.substring(comma1 + 1, comma2).c_str());
-        presetBPositions[2] = atol(response.substring(comma2 + 1, comma3).c_str());
-        presetBPositions[3] = atol(response.substring(comma3 + 1).c_str());
-
-        presetBReceived = true;
-    } else if (response.startsWith("SET_MSSPEED")) {
-        msSpeed = response.substring(11).toFloat();
-        max_speed_left = msSpeed;
-    }
-}
-
-
 void sendCurrentMotorPositions() {
     String message = "CURRENT_POS:";
     message += String(stepper1.currentPosition()) + ",";
     message += String(stepper2.currentPosition()) + ",";
     message += String(stepper3.currentPosition()) + ",";
     message += String(stepper4.currentPosition());
-    sendControllerMessage(message.c_str());
+    sendUDPMessage(message.c_str());
 }
 
 void sendMsSpeed() {
     String message = "MSSPEED:" + String(msSpeed);
-    sendControllerMessage(message.c_str());
+    sendUDPMessage(message.c_str());
 }
 
 void sendUDPMessage(const char *message) {
-    if (!udpControllerKnown) return;
-
     Udp.beginPacket(Udp.remoteIP(), Udp.remotePort());
     Udp.write(message);
     Udp.endPacket();
-}
-
-void sendRadioMessage(const char *message) {
-    if (!radioReady) return;
-
-    radio.stopListening();
-    radio.openWritingPipe(radioControllerAddress);
-    radio.write(message, strlen(message) + 1);
-    radio.startListening();
-}
-
-void sendControllerMessage(const char *message) {
-    // Send telemetry/status to both possible controllers.
-    // Ethernet still works when the Python app is connected.
-    // NRF24 works when the Nano handheld is connected.
-    sendUDPMessage(message);
-    sendRadioMessage(message);
 }
 
 void saveMotorPositions() {
@@ -505,7 +391,7 @@ void sendPresetPositions() {
     message += String(presetBPositions[1]) + ",";
     message += String(presetBPositions[2]) + ",";
     message += String(presetBPositions[3]);
-    sendControllerMessage(message.c_str());
+    sendUDPMessage(message.c_str());
 }
 
 const int tolerance = 1000;
@@ -515,7 +401,7 @@ void recallPresetA() {
         abs(stepper2.currentPosition() - presetAPositions[1]) <= tolerance &&
         abs(stepper3.currentPosition() - presetAPositions[2]) <= tolerance &&
         abs(stepper4.currentPosition() - presetAPositions[3]) <= tolerance) {
-        sendControllerMessage("PRESET_A_DONE");
+        sendUDPMessage("PRESET_A_DONE");
         return;
     }
     long targetPositions[] = { presetAPositions[0], presetAPositions[1], presetAPositions[2], presetAPositions[3] };
@@ -528,7 +414,7 @@ void recallPresetA() {
     display.println("Preset A Done");
     display.display();
     syncMove(max_speed_left, 400);  // Use max_speed_left instead of msSpeed
-    sendControllerMessage("PRESET_A_DONE");
+    sendUDPMessage("PRESET_A_DONE");
 }
 
 void recallPresetB() {
@@ -536,7 +422,7 @@ void recallPresetB() {
         abs(stepper2.currentPosition() - presetBPositions[1]) <= tolerance &&
         abs(stepper3.currentPosition() - presetBPositions[2]) <= tolerance &&
         abs(stepper4.currentPosition() - presetBPositions[3]) <= tolerance) {
-        sendControllerMessage("PRESET_B_DONE");
+        sendUDPMessage("PRESET_B_DONE");
         return;
     }
     long targetPositions[] = { presetBPositions[0], presetBPositions[1], presetBPositions[2], presetBPositions[3] };
@@ -549,7 +435,7 @@ void recallPresetB() {
     display.println("Preset B Done");
     display.display();
     syncMove(max_speed_left, 400);  // Use max_speed_left instead of msSpeed
-    sendControllerMessage("PRESET_B_DONE");
+    sendUDPMessage("PRESET_B_DONE");
 }
 
 void syncMove(float maxSpeed, float accel) {
