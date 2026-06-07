@@ -10,8 +10,6 @@
 // Ethernet settings
 byte mac[] = { 0xA8, 0x61, 0x0A, 0xAE, 0x03, 0x30 };
 unsigned int localPort = 44158;
-// Use static IP to avoid 60s DHCP timeout when no network is present.
-// Change to false if you need DHCP (e.g. when PC controller is active).
 const bool USE_STATIC_IP = true;
 IPAddress staticIP(192, 168, 1, 177);
 EthernetUDP Udp;
@@ -60,11 +58,10 @@ float msSpeed = 2000, slideSpeed = 20;
 long saved_position1 = 0, saved_position2 = 0, saved_position3 = 0, saved_position4 = 0;
 bool loopPresets = false;
 bool autoLoopRunning = false;
-bool megaLoopEnabled = false; // local mirror of Nano loop state for OLED
 long presetAPositions[] = {0, 0, 0, 0}, presetBPositions[] = {0, 0, 0, 0};
 
-// Motor control variables (no longer const for dynamic updates)
-int max_speed_left = msSpeed;  // Changed from const to int
+// Motor control variables
+int max_speed_left = msSpeed;
 const int max_speed_right = 100;
 const int max_speed_y = 100;
 const int max_speed_zoom = 75;
@@ -100,15 +97,6 @@ bool presetBReceived = false;
 bool ethernetActive = false;
 uint8_t lastRemoteButtonMask = 0;
 
-// NRF24 diagnostics
-unsigned long nrf24LastRxTime = 0;
-unsigned long nrf24PacketCount = 0;
-bool nrf24SignalLost = false;
-
-// OLED popup message
-char oledMessage[32] = "";
-unsigned long oledMessageUntil = 0;
-
 void setup() {
     Serial.begin(115200);
     while (!Serial) { ; }
@@ -129,7 +117,7 @@ void setup() {
 
     Serial.println(F("2. Steppers init..."));
     // Initialize stepper settings
-    stepper1.setMaxSpeed(max_speed_left);  // Use max_speed_left instead of msSpeed
+    stepper1.setMaxSpeed(max_speed_left);
     stepper2.setMaxSpeed(max_speed_left);
     stepper3.setMaxSpeed(max_speed_left);
     stepper4.setMaxSpeed(max_speed_left);
@@ -139,17 +127,16 @@ void setup() {
     multiStepper.addStepper(stepper4);
 
     Serial.println(F("3. Ethernet begin..."));
-    // Initialize Ethernet
     if (USE_STATIC_IP) {
         Ethernet.begin(mac, staticIP);
         Serial.print(F("Static IP: ")); Serial.println(Ethernet.localIP());
     } else {
-        Ethernet.begin(mac); // DHCP - may hang 60s if no network
+        Ethernet.begin(mac);
     }
     Serial.println(F("4. UDP begin..."));
     Udp.begin(localPort);
     Serial.println(F("5. Waiting 1s for link..."));
-    delay(1000); // W5100 needs time to negotiate
+    delay(1000);
 
     Serial.println(F("6. Checking link status..."));
     EthernetLinkStatus link = Ethernet.linkStatus();
@@ -161,7 +148,6 @@ void setup() {
     Serial.print(F("ethernetActive = ")); Serial.println(ethernetActive ? F("true") : F("false"));
 
     Serial.println(F("7. OLED init..."));
-    // Initialize OLED display
     Wire.begin();
     delay(100);
     oledOK = display.begin(SSD1306_SWITCHCAPVCC, 0x3C);
@@ -176,7 +162,6 @@ void setup() {
 
     Serial.println(F("8. Mode selection..."));
     if (ethernetActive) {
-        // --- UDP mode: wait for PC with 10s timeout ---
         Serial.println(F("Mode: ETH (UDP)"));
         if (oledOK) {
             display.setCursor(0, 0);
@@ -197,7 +182,6 @@ void setup() {
             delay(10);
         }
 
-        // Request positions/presets with retries
         if (controllerFound) {
             int retryCount = 0;
             const int maxRetries = 3;
@@ -291,7 +275,6 @@ void setup() {
             display.display();
         }
     } else {
-        // --- NRF24 mode ---
         Serial.println(F("Mode: NRF24"));
         if (oledOK) {
             display.setCursor(0, 0);
@@ -301,7 +284,6 @@ void setup() {
     }
 
     Serial.println(F("9. NRF24 init..."));
-    // --- NRF24 init (always active for receiving) ---
     if (radio.begin()) {
         Serial.println(F("NRF24: Initialized OK"));
         radio.setPALevel(RF24_PA_LOW);
@@ -339,18 +321,6 @@ void loop() {
         previousDisplayMillis = currentMillis;
         updateOLEDPositions();
     }
-
-    // NRF24 no-signal warning (NRF24 mode only)
-    if (!ethernetActive && currentMillis - nrf24LastRxTime > 5000 && !nrf24SignalLost) {
-        nrf24SignalLost = true;
-        Serial.println(F("*** NRF24 NO SIGNAL > 5s ***"));
-        if (oledOK) {
-            display.clearDisplay();
-            display.setCursor(0, 0);
-            display.println(F("NO NRF24 SIGNAL"));
-            display.display();
-        }
-    }
 }
 
 // ============================================================
@@ -373,42 +343,25 @@ void handleNRF24Requests() {
     if (calcChecksum != rxPacket.checksum) return;
 
     // --- Joystick: map -100..100 to -1.0..1.0 ---
-    // Left stick X = slide, Left stick Y = zoom
-    // Right stick X = pan, Right stick Y = tilt
     x_axis_value_left  = rxPacket.lx / 100.0;
     y_axis_value       = rxPacket.ry / 100.0;
     x_axis_value_right = rxPacket.rx / 100.0;
-    // Left Y maps to zoom (triggers). Positive LY = zoom in, negative = zoom out
     float ly = rxPacket.ly / 100.0;
     trigger_right = (ly > 0) ? ly : 0;
     trigger_left  = (ly < 0) ? -ly : 0;
 
-    // Extract loop state from bit 7 of every packet
-    megaLoopEnabled = (rxPacket.buttons & 0x80) != 0;
-
     // --- Button edge detection (rising edge only) ---
-    uint8_t btnOnly = rxPacket.buttons & 0x7F; // mask out loop-state bit
-    uint8_t rising = btnOnly & ~lastRemoteButtonMask;
-    lastRemoteButtonMask = btnOnly;
+    uint8_t rising = rxPacket.buttons & ~lastRemoteButtonMask;
+    lastRemoteButtonMask = rxPacket.buttons;
 
-    if (rising & 0x02) { Serial.println(F("BTN: X -> savePresetA")); savePresetA(); showOLEDMessage("Preset A Saved"); }
-    if (rising & 0x40) { Serial.println(F("BTN: B -> savePresetB")); savePresetB(); showOLEDMessage("Preset B Saved"); }
-    if (rising & 0x08) { Serial.println(F("BTN: DPAD_L -> recallPresetA")); showOLEDMessage("Recalling Preset A"); recallPresetA(); }
-    if (rising & 0x10) { Serial.println(F("BTN: DPAD_R -> recallPresetB")); showOLEDMessage("Recalling Preset B"); recallPresetB(); }
-    if (rising & 0x04 && !autoLoopRunning) { Serial.println(F("BTN: Y -> startAutoLoop")); megaLoopEnabled = true; showOLEDMessage("Loop ON"); startAutoLoop(); }
-    if (rising & 0x20) { Serial.println(F("BTN: A -> loop OFF")); megaLoopEnabled = false; showOLEDMessage("Loop OFF"); }
-
-    // Packet received OK
-    nrf24LastRxTime = millis();
-    nrf24PacketCount++;
-    if (nrf24SignalLost) {
-        nrf24SignalLost = false;
-        Serial.println(F("*** NRF24 SIGNAL RESTORED ***"));
-    }
+    if (rising & 0x02) savePresetA();
+    if (rising & 0x40) savePresetB();
+    if (rising & 0x08) recallPresetA();
+    if (rising & 0x10) recallPresetB();
+    if (rising & 0x04 && !autoLoopRunning) startAutoLoop();
 
     // Debug print every packet
-    Serial.print(F("NRF24 RX #")); Serial.print(nrf24PacketCount);
-    Serial.print(F(" LX:")); Serial.print(rxPacket.lx);
+    Serial.print(F("NRF24 RX  LX:")); Serial.print(rxPacket.lx);
     Serial.print(F(" LY:")); Serial.print(rxPacket.ly);
     Serial.print(F(" RX:")); Serial.print(rxPacket.rx);
     Serial.print(F(" RY:")); Serial.print(rxPacket.ry);
@@ -420,39 +373,15 @@ void handleNRF24Requests() {
 // ============================================================
 // OLED DISPLAY
 // ============================================================
-void showOLEDMessage(const char* msg) {
-    if (!oledOK) return;
-    strncpy(oledMessage, msg, 31);
-    oledMessage[31] = '\0';
-    oledMessageUntil = millis() + 3000; // 3 second popup
-    // Force immediate refresh so user sees it right away
-    display.clearDisplay();
-    display.setTextSize(1);
-    display.setTextColor(SSD1306_WHITE);
-    display.setCursor(0, 0);
-    display.println(oledMessage);
-    display.display();
-    Serial.print(F("OLED popup: ")); Serial.println(msg);
-}
-
 void updateOLEDPositions() {
     if (!oledOK) return;
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-
-    // Show popup message if active
-    if (millis() < oledMessageUntil && oledMessage[0] != '\0') {
-        display.println(oledMessage);
-    } else {
-        // Normal display: positions + loop state
-        display.print(F("SLD:")); display.println(stepper1.currentPosition());
-        display.print(F("PAN:")); display.println(stepper2.currentPosition());
-        display.print(F("TLT:")); display.println(stepper3.currentPosition());
-        display.print(F("LP:"));
-        display.println(megaLoopEnabled ? F("ON") : F("OFF"));
-    }
+    display.print(F("SLD:")); display.println(stepper1.currentPosition());
+    display.print(F("PAN:")); display.println(stepper2.currentPosition());
+    display.print(F("TLT:")); display.println(stepper3.currentPosition());
     display.display();
 }
 
@@ -463,37 +392,49 @@ void startAutoLoop() {
     autoLoopRunning = true;
     Serial.println(F("Auto-loop started"));
     while (true) {
-        recallPresetA(); // blocking move to A
+        recallPresetA();
         if (!queryUnoLoopState()) break;
-        recallPresetB(); // blocking move to B
+        recallPresetB();
         if (!queryUnoLoopState()) break;
     }
     Serial.println(F("Auto-loop stopped"));
     autoLoopRunning = false;
 }
 
-// Drain radio FIFO and return Nano's latest loop state.
-// If no packet for 5s, assume dead battery -> keep looping.
+// Send query to Uno and wait for response. Returns true if Uno says loop enabled.
 bool queryUnoLoopState() {
-    bool gotPacket = false;
-    while (radio.available()) {
-        ControllerPacket pkt;
-        radio.read(&pkt, sizeof(pkt));
-        if (pkt.magic == 0xAB) {
-            uint8_t calc = pkt.magic ^ pkt.lx ^ pkt.ly ^ pkt.rx ^ pkt.ry ^ pkt.buttons;
-            if (calc == pkt.checksum) {
-                megaLoopEnabled = (pkt.buttons & 0x80) != 0;
-                nrf24LastRxTime = millis();
-                gotPacket = true;
+    Serial.println(F("Querying loop state..."));
+
+    ControllerPacket query;
+    query.magic = 0xBA;
+    query.lx = 0; query.ly = 0; query.rx = 0; query.ry = 0;
+    query.buttons = 0;
+    query.checksum = query.magic;
+
+    radio.stopListening();
+    delay(2);
+    radio.write(&query, sizeof(query));
+
+    radio.startListening();
+    delay(2);
+
+    unsigned long start = millis();
+    while (millis() - start < 100) {
+        if (radio.available()) {
+            ControllerPacket resp;
+            radio.read(&resp, sizeof(resp));
+            if (resp.magic == 0xAB) {
+                uint8_t calc = resp.magic ^ resp.lx ^ resp.ly ^ resp.rx ^ resp.ry ^ resp.buttons;
+                if (calc == resp.checksum) {
+                    bool state = (resp.buttons & 0x80) != 0;
+                    Serial.print(F("Loop state: ")); Serial.println(state ? F("true") : F("false"));
+                    return state;
+                }
             }
         }
     }
-    if (millis() - nrf24LastRxTime > 5000) {
-        Serial.println(F("No Nano signal > 5s -> dead battery, keep looping"));
-        return true;
-    }
-    Serial.print(F("Loop state: ")); Serial.println(megaLoopEnabled ? F("true") : F("false"));
-    return megaLoopEnabled;
+    Serial.println(F("Query timeout -> false"));
+    return false;
 }
 
 void handleUDPRequests() {
@@ -540,11 +481,11 @@ void handleUDPRequests() {
             loopPresets = request.substring(12) == "true";
         } else if (request.startsWith("INCREASE_SPEED")) {
             msSpeed += 200;
-            max_speed_left = msSpeed;  // Update max_speed_left
+            max_speed_left = msSpeed;
             sendMsSpeed();
         } else if (request.startsWith("DECREASE_SPEED")) {
             msSpeed -= 200;
-            max_speed_left = msSpeed;  // Update max_speed_left
+            max_speed_left = msSpeed;
             sendMsSpeed();
         }
     }
@@ -688,6 +629,10 @@ void recallPresetA() {
     }
     syncMove(max_speed_left, 400);
     sendUDPMessage("PRESET_A_DONE");
+
+    if (queryUnoLoopState()) {
+        recallPresetB();
+    }
 }
 
 void recallPresetB() {
@@ -711,6 +656,10 @@ void recallPresetB() {
     }
     syncMove(max_speed_left, 400);
     sendUDPMessage("PRESET_B_DONE");
+
+    if (queryUnoLoopState()) {
+        recallPresetA();
+    }
 }
 
 void syncMove(float maxSpeed, float accel) {
@@ -727,10 +676,6 @@ void syncMove(float maxSpeed, float accel) {
     allSpeeds[2] = fabs(stepper3.distanceToGo());
     allSpeeds[3] = fabs(stepper4.distanceToGo());
     float biggestDistance = findBiggestNumFloatArray(allSpeeds, "max");
-    if (biggestDistance == 0) {
-        Serial.println(F("syncMove: already at target, skipping"));
-        return;
-    }
 
     stepper1.setMaxSpeed(calcSync(maxSpeed, accel, biggestDistance, stepper1));
     stepper1.setAcceleration(calcSync(maxSpeed, accel, biggestDistance, stepper1) / 2);
